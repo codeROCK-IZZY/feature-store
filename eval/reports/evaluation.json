@@ -1,0 +1,59 @@
+{
+  "events": 68655,
+  "labels": 44000,
+  "late_share": 0.05800014565581531,
+  "positive_share": 0.6065227272727273,
+  "consistency": {
+    "point in time (this store)": 0.0,
+    "event time, ignoring arrival": 0.015295454545454546,
+    "keyed on the label date": 0.9371590909090909,
+    "today's snapshot": 0.9523181818181818
+  },
+  "auc": {
+    "point in time (this store)": {
+      "offline": 0.8116835454210667,
+      "production": 0.8116835454210667
+    },
+    "event time, ignoring arrival": {
+      "offline": 0.8113150815477685,
+      "production": 0.8107268621009582
+    },
+    "keyed on the label date": {
+      "offline": 0.999998437576857,
+      "production": 0.7067362857474325
+    },
+    "today's snapshot": {
+      "offline": 0.8629484690397108,
+      "production": 0.7729384448564343
+    }
+  },
+  "skew": {
+    "healthy serving": {
+      "txn_count_7d": 0.023076782528777436,
+      "txn_count_30d": 0.056271341724854616,
+      "amount_sum_7d": 0.014044073477586436,
+      "amount_sum_30d": 0.04398094096999985,
+      "amount_mean_30d": 0.040101157888633554,
+      "amount_max_30d": 0.04395840258945644,
+      "categories_30d": 0.054840547024652006,
+      "days_since_last": 0.059122886490439015
+    },
+    "serving with amounts in pence": {
+      "txn_count_7d": 0.023076782528777436,
+      "txn_count_30d": 0.056271341724854616,
+      "amount_sum_7d": 2.5180204418000858,
+      "amount_sum_30d": 5.981602567982338,
+      "amount_mean_30d": 6.189226450866805,
+      "amount_max_30d": 6.187848229449798,
+      "categories_30d": 0.054840547024652006,
+      "days_since_last": 0.059122886490439015
+    }
+  },
+  "online_ms": {
+    "p50": 0.30409987084567547,
+    "p95": 0.5370496772229671,
+    "p99": 0.8298573736101388
+  },
+  "offline_rows_per_s": 3232.543935829627,
+  "seconds": 75.08922699978575
+}

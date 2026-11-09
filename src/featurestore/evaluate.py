@@ -1,0 +1,152 @@
+"""The evaluation: does training see what serving sees, what does it cost when it doesn't, and is skew caught?"""
+
+from __future__ import annotations
+
+import json
+import time
+from dataclasses import asdict, dataclass, field
+
+import numpy as np
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.metrics import roc_auc_score
+
+from . import data, stores
+from .features import FEATURES
+
+MODES = {
+    "point_in_time": "point in time (this store)",
+    "event_time": "event time, ignoring arrival",
+    "label_date": "keyed on the label date",
+    "snapshot": "today's snapshot",
+}
+TRAIN_UNTIL = 75.0
+PSI_ALERT = 0.2
+
+
+@dataclass
+class Result:
+    events: int
+    labels: int
+    late_share: float
+    positive_share: float
+    consistency: dict[str, float] = field(default_factory=dict)  # mode -> share of rows that differ from serving
+    auc: dict[str, dict[str, float]] = field(default_factory=dict)  # mode -> offline / production
+    skew: dict[str, dict[str, float]] = field(default_factory=dict)  # scenario -> feature -> PSI
+    online_ms: dict[str, float] = field(default_factory=dict)
+    offline_rows_per_s: float = 0.0
+    seconds: float = 0.0
+
+
+def run(n_users: int = 4000, seed: int = 3) -> Result:
+    t0 = time.perf_counter()
+    ev, lb = data.generate(n_users, seed)
+    r = Result(len(ev.user), len(lb.user), float(np.mean(ev.ingest_time - ev.event_time > 0.5)), float(lb.y.mean()))
+    t = time.perf_counter()
+    x = {"point_in_time": stores.offline(ev, lb, FEATURES, "point_in_time")}
+    r.offline_rows_per_s = len(lb.user) / (time.perf_counter() - t)
+    for mode in ("event_time", "label_date", "snapshot"):
+        x[mode] = stores.offline(ev, lb, FEATURES, mode)
+    online = stores.replay(ev, lb, stores.OnlineStore(FEATURES))
+    for mode, v in x.items():
+        r.consistency[MODES[mode]] = float(np.mean(~np.isclose(v, online, rtol=1e-9, atol=1e-9).all(axis=1)))
+
+    train, test = lb.ts < TRAIN_UNTIL, lb.ts >= TRAIN_UNTIL
+    for mode, v in x.items():
+        m = HistGradientBoostingClassifier(max_iter=200, random_state=0).fit(v[train], lb.y[train])
+        r.auc[MODES[mode]] = {
+            "offline": float(roc_auc_score(lb.y[test], m.predict_proba(v[test])[:, 1])),
+            "production": float(roc_auc_score(lb.y[test], m.predict_proba(online[test])[:, 1])),
+        }
+
+    # skew: the training distribution against what serving produced on the test period, healthy and with a bug
+    buggy = stores.replay(ev, lb, stores.OnlineStore(FEATURES, amount_scale=100.0))  # pence sent where pounds expected
+    ref = x["point_in_time"][train]
+    for name, serving in (("healthy serving", online[test]), ("serving with amounts in pence", buggy[test])):
+        r.skew[name] = {f.name: stores.psi(ref[:, k], serving[:, k]) for k, f in enumerate(FEATURES)}
+
+    store = stores.OnlineStore(FEATURES)
+    for i in np.argsort(ev.ingest_time):
+        store.ingest(int(ev.user[i]), float(ev.event_time[i]), float(ev.amount[i]), int(ev.category[i]))
+    times = []
+    rng = np.random.default_rng(0)
+    for u in rng.integers(0, n_users, 2000):
+        s = time.perf_counter()
+        store.get(int(u), float(data.DAYS))
+        times.append((time.perf_counter() - s) * 1000)
+    a = np.array(times)
+    r.online_ms = {
+        "p50": float(np.percentile(a, 50)),
+        "p95": float(np.percentile(a, 95)),
+        "p99": float(np.percentile(a, 99)),
+    }
+    r.seconds = time.perf_counter() - t0
+    return r
+
+
+def check(r: Result) -> list[str]:
+    p = []
+    pit = MODES["point_in_time"]
+    if r.consistency[pit] != 0.0:
+        p.append(f"point-in-time training rows differ from serving: {r.consistency[pit]:.4f}")
+    if abs(r.auc[pit]["offline"] - r.auc[pit]["production"]) > 1e-9:
+        p.append("point-in-time offline AUC should equal production AUC")
+    for mode in ("label_date", "snapshot"):
+        a = r.auc[MODES[mode]]
+        if a["offline"] - a["production"] < 0.05:
+            p.append(f"{mode}: the leak should inflate offline AUC; the demonstration is broken")
+    healthy, bug = r.skew["healthy serving"], r.skew["serving with amounts in pence"]
+    if max(healthy.values()) >= PSI_ALERT:
+        p.append(f"false skew alarm on healthy serving: {max(healthy, key=lambda k: healthy[k])}")
+    if not all(bug[f] >= PSI_ALERT for f in ("amount_sum_30d", "amount_mean_30d", "amount_max_30d")):
+        p.append("the pence bug should trip the skew alarm on amount features")
+    return p
+
+
+def to_json(r: Result) -> str:
+    return json.dumps(asdict(r), indent=2) + "\n"
+
+
+def to_markdown(r: Result) -> str:
+    L = [
+        "# Evaluation",
+        "",
+        f"{r.events:,} transactions, {r.labels:,} labelled moments ({r.positive_share:.0%} positive: bought within 14 days); "
+        f"{r.late_share:.1%} of events arrive a day or more late. Models train on moments before day {TRAIN_UNTIL:.0f} and "
+        "are scored after it. Generated by `featurestore evaluate`.",
+        "",
+        "## Does training see what serving sees?",
+        "",
+        "| training set built from | rows that differ from what serving returned |",
+        "|---|---:|",
+    ]
+    L += [f"| {k} | {v:.2%} |" for k, v in r.consistency.items()]
+    L += [
+        "",
+        "## What the difference costs (AUC)",
+        "",
+        "| training set built from | offline (what the team sees) | production (what customers get) | gap |",
+        "|---|---:|---:|---:|",
+    ]
+    L += [
+        f"| {k} | {v['offline']:.4f} | {v['production']:.4f} | {v['offline'] - v['production']:+.4f} |"
+        for k, v in r.auc.items()
+    ]
+    L += [
+        "",
+        f"## Training/serving skew (PSI, alert at {PSI_ALERT})",
+        "",
+        "| feature | " + " | ".join(r.skew) + " |",
+        "|---|" + "---:|" * len(r.skew),
+    ]
+    for f in FEATURES:
+        L.append(f"| {f.name} | " + " | ".join(f"{v[f.name]:.3f}" for v in r.skew.values()) + " |")
+    o = r.online_ms
+    L += [
+        "",
+        "## Speed",
+        "",
+        f"Online feature lookup: p50 {o['p50']:.3f} ms, p95 {o['p95']:.3f} ms, p99 {o['p99']:.3f} ms. "
+        f"Offline point-in-time join: {r.offline_rows_per_s:,.0f} rows per second.",
+        "",
+    ]
+    return "\n".join(L)
